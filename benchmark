@@ -1,0 +1,445 @@
+#!/bin/bash
+# Benchmark.sh v0.8 - Gentoo Linux RAID & Filesystem Benchmarking script.
+##
+# Copyright (C) 2007-2013 Mission Accomplish, Inc.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
+##
+# TODO:
+#   1) partition schemes
+#   2) ctrl+c clean up.
+#   3) raid levels array.
+#   4) arch arrays.
+#   5) tiobench benchmarks.
+#   6) automated resuming.
+#   7) command line arguments.
+#   8) separate benchmark commands into functions.
+#   9) add zfs support4
+##
+# Changelog mm/dd/y
+#   12/01/2007 - Initial release.
+#   12/05/2007 - Dry run feature (DEBUG) variable.
+#   12/06/2007 - do_bench and do_exec functions.
+#   12/09/2007 - error checking & reporting.
+#   12/12/2007 - Released under the GNU/GPL v2 license.
+#   12/14/2007 - do_bench adjustments for logging. added function for success and failure events.
+##
+
+fs=( ext2 ext3 ext4 btrfs reiserfs reiser4 jfs xfs )    			# File System's Array.
+extfs_jmodes=( journal_data journal_data_ordered journal_data_writeback ) 	# EXTFS journal modes.
+raid_level="0"									# RAID Level to benchmark.
+chunk=( 64 128 256 512 1024 2048 4096 8192 16384 )				# Array Chunk Values.
+partitions="2"									# Number of raid partitions to test.
+drives="4"									# Number of available hard drives to use.
+DEBUG="0"									# 0 = off; 1 = on. (do_bench script output)
+mnt_src=/mnt/gentoo
+logdir="${HOME}"
+chroot_script=$(mktemp /tmp/XXXXXXX)
+alphabet="$(echo {a..z}|tr -d ' ')"
+black='\e[1;48;30m'
+blue='\e[1;48;34m'
+red='\e[1;48;31m'
+nocolor='\e[0m'
+
+do_bench() {
+    if [ ${DEBUG} = 0 ]; then
+        case ${1} in
+	    rm-portage|rm-gentoo)
+	        shift
+	        /root/time --format="real: %E\nuser: %U\nsys: %S\ncpu: %P" ${@}
+	        ;;
+	    tar)
+		shift
+		/root/time --format="command: %C\nreal: %E\nuser: %U\nsys: %S\ncpu: %P" -a ${@}
+		;;
+	    *)
+		/root/time --format="command: %C\nreal: %E\nuser: %U\nsys: %S\ncpu: %P" ${@}
+		;;
+	esac
+    else
+        echo -e "\a${red}debug:${nocolor}${blue} (${@})"${nocolor}
+    fi
+}
+
+do_exec() {
+    if [ ${DEBUG} = 0 ]; then
+        ${@}
+    else
+        echo -e "\a${red}debug:${nocolor}${blue} (${@})"${nocolor}
+    fi
+}
+
+einfo() {
+    echo -e "\a${black}.: ${1} :."${nocolor}
+    sleep 2
+}
+
+ewarn() {
+    echo -e "\a${red}.: ${1} :."${nocolor}
+}
+
+error() {
+    echo -e "\a${red}.: ${1} :."${nocolor}
+    echo -e "\a${red}.: ${fs[y]} filesystem on /dev/md${z} raid${raid_level}. exiting. :."
+    exit 1
+}
+
+exec_chkdir() {
+    if [ ! -d "${1}" ]; then
+        einfo "Creating directory ${1}"
+	mkdir ${1}
+    fi
+}
+
+exec_fs() {
+    local t=0 fs_opts
+
+    einfo "Creating ${fs[y]} on /dev/md${z}"
+    case ${fs[y]} in
+        ext2|ext3|ext4)
+	    do_bench -o ${log}/mkfs-md${z}-${chunk[w]} mkfs -t ${fs[y]} -q -E stride=$((${chunk[w]}/4)) \
+/dev/md${z} || error "Failed to create filesystem at line:$LINENO"
+
+	    # loop through extfs journal modes.
+	    until ((t==${#extfs_jmodes[*]})); do
+	        do_bench -o ${log}/tune2fs-${extfs_jmodes[t]}-md${z}-${chunk[w]} \
+tune2fs -o ${extfs_jmodes[t]} /dev/md${z} 1>/dev/null || error "Failed to tune ${fs[y]} filesystem at line:$LINENO"
+		do_bench -o ${log}/mount-${extfs_jmodes[t]}-md${z}-${chunk[w]} \
+mount /dev/md${z} ${mnt_src} 2>/dev/null || error "Failed to mount at line:$LINENO"
+		exec_tar
+		((t++))
+	    done
+				;;
+	reiser4|reiserfs|jfs|xfs|btrfs)
+	    [ ${fs[y]} = btrfs ] && fs_opts=""
+	    [ ${fs[y]} = reiser4 ] && fs_opts="-y"
+	    [ ${fs[y]} = xfs ] && fs_opts="-q -f"
+	    do_bench -o ${log}/mkfs-md${z}-${chunk[w]} mkfs -t ${fs[y]} ${fs_opts:--q} \
+/dev/md${z} 1>&2>/dev/null || error "Failed to create filesystem at line:$LINENO"
+	    do_bench -o ${log}/mount-md${z}-${chunk[w]} mount /dev/md${z} ${mnt_src} 1>&2>/dev/null \
+|| error "Failed to mount at line:$LINENO"
+	    exec_tar
+	    ;;
+    esac
+}
+
+exec_tar() {
+    # set default variable
+    local var=untar-md${z}-${chunk[w]}
+
+    cd ${mnt_src}
+    einfo "Downloading Gentoo stage3 tarball and portage snapshot."
+
+    # append extfs journal mode type in log
+    if [[ ${fs[y]} =~ (ext2|ext3|ext4) ]]; then var=untar-${extfs_jmodes[t]}-md${z}-${chunk[w]}; fi
+
+    do_exec wget -q http://weboperative.com/gentoo/native/Core2Duo/stage3-i686-2007.0.tar.bz2 \
+|| error "Failed to download stage3 tarball at line:$LINENO"
+    do_bench tar -o ${log}/${var} tar xvjpf stage3-i686-2007.0.tar.bz2 \
+1>/dev/null || error "Failed to extract stage3 tarball at line:$LINENO"
+    do_exec wget -q http://gentoo.mirrors.tds.net/pub/gentoo/snapshots/portage-latest.tar.bz2 \
+|| error "Failed to download portage snapshot at line:$LINENO"
+    do_bench tar -o ${log}/${var} tar xvjpf portage-latest.tar.bz2 -C \
+usr/ 1>/dev/null || error "Failed to extract portage snapshot at line:$LINENO"
+    exec_sys
+}
+
+exec_sys() {
+    cd $OLDPWD
+
+    # Create any missing system directories & filesystem log folders before the chroot.
+    for dir in /proc /tmp /sys /dev ${logdir}/.${fs[y]}; do
+        if [ ! -d ${mnt_src}${dir} ]; then
+	    do_exec mkdir ${mnt_src}${dir}
+	fi
+    done
+
+    do_exec mount -t proc none ${mnt_src}/proc
+    do_exec mount -o bind /dev ${mnt_src}/dev
+    do_exec mount -t sysfs none ${mnt_src}/sys
+    do_exec cp /etc/resolv.conf ${mnt_src}/etc
+    do_exec cp ${logdir}/time ${mnt_src}${logdir}
+    do_exec [ -f ${chroot_script} ] && >${chroot_script}
+
+# Create chroot script with necessary variables.
+cat >> ${chroot_script} << CHROOT
+#!/bin/bash
+
+DEBUG="${DEBUG}"
+env_md="${z}"
+env_raid_level="${raid_level}"
+env_extfs_jmodes="${extfs_jmodes[t]}"
+env_chunk="${chunk[w]}"
+env_fs="${fs[y]}"
+log="$HOME/.\${env_fs}"
+black='\e[1;48;30m'
+blue='\e[1;48;34m'
+red='\e[1;48;31m'
+nocolor='\e[0m'
+
+do_bench() {
+    if [ \${DEBUG} = 0 ]; then
+        case \${1} in
+            rm-portage|rm-gentoo)
+                shift
+                /root/time --format="real: %E\nuser: %U\nsys: %S\ncpu: %P" \${@}
+                ;;
+            tar)
+                shift
+                /root/time --format="command: %C\nreal: %E\nuser: %U\nsys: %S\ncpu: %P" -a \${@}
+                ;;
+            *)
+                /root/time --format="command: %C\nreal: %E\nuser: %U\nsys: %S\ncpu: %P" \${@}
+                ;;
+        esac
+    else
+        echo -e "\a\${red}debug:\${nocolor}\${blue} (\${@})"\${nocolor}
+    fi
+}
+
+do_exec() {
+    if [ \${DEBUG} = 0 ]; then
+        \${@}
+    else
+        echo -e "\a\${red}debug:\${nocolor}\${blue} (\${@})"\${nocolor}
+    fi
+}
+
+einfo() {
+    echo -e "\a\${black}.: \${1} :."\${nocolor}
+    sleep 2
+}
+
+ewarn() {
+    echo -e "\a\${red}.: \${1} :."\${nocolor}
+}
+
+error() {
+    echo -e "\a\${red}.: \${1} :."\${nocolor}
+    echo -e "\a\${red}.: \${env_fs} filesystem on /dev/md\${env_md/%-*/} raid\${env_raid_level}. exiting. :."
+    exit 1
+}
+    einfo "Entered CHROOT environment, benchmarks starting..."
+    do_exec env-update 1>&2>/dev/null || error "Failed at line:\$LINENO"
+    do_exec source /etc/profile || error "Failed at line:\$LINENO"
+
+    einfo "Checking dependencies."
+    for i in bonnie++ iozone ; do
+        if ! \$(hash \${i} 2>/dev/null); then
+	    einfo "Emerging \${i}."
+	    emerge \${i} -q 1>&2>/dev/null
+	fi
+    done
+
+    case \${env_fs} in
+        ext2|ext3|ext4)
+	    env_md="\${env_md}-\${env_extfs_jmodes}"
+	    ;;
+    esac
+
+    einfo "Beginning of I/O \${env_fs} filesystem benchmarks on /dev/md\${env_md/%-*/}."
+    einfo "dd benchmarks started at \$(date +%H:%M)."
+    [ ! -e "\${log}/dd-logs" ] && touch \${log}/dd-logs
+
+    for bs in 512 1024 2048 4096 8192; do
+        for count in 2 8 16 32; do
+	    ((bs==512)) && (( count = count * 4 ))
+	        if [[ ! \$(grep "\${env_fs}-\${env_md}-\${env_chunk}-\${bs}-\${count}" \${log}/dd-logs) ]]; then
+		    einfo "running: (dd if=/dev/zero of=\${bs}k bs=\${bs}k count=\${count}k)"
+		    do_bench -o \${log}/dd-md\${env_md}-\${env_chunk} \
+dd if=/dev/zero of=\${bs}k bs=\${bs}k count=\${count}k 2>\${log}/dd-bs-\${bs}k-count-\${count}k-md\${env_md}-\${env_chunk} \
+|| error "Failed (dd if=/dev/zero of=\${bs}k bs=\${bs}k count=\${count}k) benchmark at line:\$LINENO"
+
+                    do_exec rm \${bs}k || error "Failed (rm \${bs}k) at line:\$LINENO"
+		    do_exec sync || error "Failed (sync) at line:\$LINENO"
+		    do_exec echo "\${env_fs}-\${env_md}-\${env_chunk}-\${bs}-\${count}" >>\${log}/dd-logs
+		else
+		    ewarn "Skipping command: (dd if=/dev/zero of=\${bs}k bs=\${bs}k count=\${count}k) benchmark."
+		    sleep 2
+		fi
+	done
+    done
+
+    einfo "dd benchmarks finished at \$(date +%H:%M). starting zcav benchmarks."
+    [ ! -e "\${log}/zcav-logs" ] && touch \${log}/zcav-logs
+
+    if [[ ! \$(grep "\${env_fs}-\${env_md}-\${env_chunk}-zcav" \${log}/zcav-logs) ]]; then
+        einfo "running: (zcav /dev/md\${env_md/%-*/})"
+	do_bench -o \${log}/zcav-md\${env_md}-\${env_chunk} zcav /dev/md\${env_md/%-*/} \
+>\${log}/zcav-stdout-md\${env_md}-\${env_chunk} || error "Failed (zcav /dev/md\${env_md/%-*/}) at line:\$LINENO"
+	do_exec echo "\${env_fs}-\${env_md}-\${env_chunk}-zcav" >>\${log}/zcav-logs
+	do_exec sync || error "Failed (sync) at line:\$LINENO"
+	einfo "zcav benchmark finished at \$(date +%H:%M). starting bonnie++ benchmarks."
+    else
+	ewarn "Skipping command: (zcav /dev/md\${env_md/%-*/}) benchmark."
+	sleep 2
+    fi
+
+    [ ! -e "\${log}/bonnie-logs" ] && touch \${log}/bonnie-logs
+
+    for size in 8192 16384; do
+        if [[ ! \$(grep "\${env_fs}-\${env_md}-\${env_chunk}-\${size}-bonnie" \${log}/bonnie-logs) ]]; then
+	    einfo "running: (bonnie++ -s \${size} -u nobody:nobody -d /tmp -m gentoo-\${env_fs} -q)"
+	    do_bench -o \${log}/bonnie_custom-md\${env_md}-\${env_chunk} bonnie++ -s \${size} -u nobody:nobody \
+-d /tmp -m gentoo-\${env_fs} -q >>\${log}/bonnie_custom-stdout-md\${env_md}-\${env_chunk} \
+|| error "Failed (bonnie++ -s \${size} -u nobody:nobody -d /tmp -m gentoo-\${env_fs} -q) at line:\$LINENO"
+	    do_exec sync || error "Failed (sync) at line:\$LINENO"
+	    do_exec echo "\${env_fs}-\${env_md}-\${env_chunk}-\${size}-bonnie" >>\${log}/bonnie-logs
+	else
+	    ewarn "Skipping command: (bonnie++ -s \${size} -u nobody:nobody -d /tmp -m gentoo-\${env_fs}) benchmark."
+	    sleep 2
+	fi
+    done
+
+    einfo "bonnie++ benchmarks finished at \$(date +%H:%M). starting iozone runs."
+    [ ! -e "\${log}/iozone-logs" ] && touch \${log}/iozone-logs
+
+    if [[ ! \$(grep "\${env_fs}-\${env_md}-\${env_chunk}-iozone" \${log}/iozone-logs) ]]; then
+        einfo "running: (iozone -Raz -g 8G)"
+	do_bench -o \${log}/iozone-md\${env_md}-\${env_chunk} iozone -Raz -g 8G \
+>\${log}/iozone-8G-md\${env_md}-\${env_chunk} || error "Failed (iozone -Raz -g 8G) at line:\$LINENO"
+	do_exec echo "\${env_fs}-\${env_md}-\${env_chunk}-iozone" >>\${log}/iozone-logs
+
+        einfo "iozone benchmarks finished at \$(date +%H:%M). starting the portage tree removal benchmark."
+    else
+	ewarn "Skipping command: (iozone -Raz -g 8G) benchmark."
+	sleep 2
+    fi
+
+    [ ! -e "\${log}/portage-logs" ] && touch \${log}/portage-logs
+
+    if [[ ! \$(grep "\${env_fs}-\${env_md}-\${env_chunk}-rm" \${log}/portage-logs) ]]; then
+        einfo "running: (rm -rf /usr/portage/*)"
+        do_bench rm-portage -o \${log}/rm-portage-md\${env_md}-\${env_chunk} rm -rf /usr/portage/* \
+|| error "Failed (rm -rf /usr/portage/*) at line:\$LINENO"
+        do_exec echo "\${env_fs}-\${env_md}-\${env_chunk}-rm" >>\${log}/portage-logs
+        einfo "Portage tree removal benchmark finished at \$(date +%H:%M)."
+    else
+	ewarn "Skipping command: (rm -rf /usr/portage/*) benchmark."
+	sleep 2
+    fi
+
+    if [[ ! \$(grep "\${env_fs}-\${env_md}-\${env_chunk}-sync" \${log}/portage-logs) ]]; then
+        einfo "running: (emerge --sync)"
+	do_bench -o \${log}/emerge-sync-md\${env_md}-\${env_chunk} emerge --sync -q \
+|| error "Failed (emerge --sync) at line:\$LINENO"
+	do_exec echo "\${env_fs}-\${env_md}-\${env_chunk}-sync" >>\${log}/portage-logs
+	einfo "Portage tree sync benchmark finished at \$(date +%H:%M)."
+    else
+        ewarn "Skipping command: (emerge --sync) benchmark."
+	sleep 2
+    fi
+
+    einfo "Leaving /dev/md\${env_md/%-*/} chroot environment on \${env_fs}."
+    exit && exit
+CHROOT
+
+    do_exec cp ${chroot_script} ${mnt_src}/tmp/
+    do_exec chmod +x ${mnt_src}${chroot_script}
+    do_exec cp ${logdir}/.${fs[y]}/* ${mnt_src}${logdir}/.${fs[y]}/
+    do_exec chroot ${mnt_src} ${chroot_script}
+
+    if (($?==0)); then exec_exit_chroot success; else exec_exit_chroot failure; fi
+
+    case ${fs[y]} in
+        ext2|ext3|ext4)
+	    do_bench -o ${log}/umount-${extfs_jmodes[t]}-md${z}-${chunk[w]} umount ${mnt_src} \
+|| error "Failed to umount at line:$LINENO"
+	    do_exec mount /dev/md${z} ${mnt_src}
+	    do_bench rm-gentoo -o ${log}/rm-gentoo-${extfs_jmodes[t]}-md${z}-${chunk[w]} rm -rf ${mnt_src}/* \
+|| error "Failed to rm ${mnt_src}/* at line:$LINENO"
+	    do_bench -o ${log}/rm-gentoo-umount-${extfs_jmodes[t]}-md${z}-${chunk[w]} umount ${mnt_src} \
+|| error "Failed to umount at line:$LINENO"
+	    einfo "DONE with ${fs[y]} on /dev/md${z} using ${extfs_jmodes[t]} mode."
+			;;
+	reiserfs|reiser4|jfs|xfs|btrfs)
+	    do_bench -o ${log}/umount-md${z}-${chunk[w]} umount ${mnt_src} \
+|| error "Failed to umount at line:$LINENO"
+	    do_exec mount /dev/md${z} ${mnt_src}
+	    do_bench rm-gentoo -o ${log}/rm-gentoo-md${z}-${chunk[w]} rm -rf ${mnt_src}/* \
+|| error "Failed to umount at line:$LINENO"
+	    do_bench -o ${log}/rm-gentoo-umount-md${z}-${chunk[w]} umount ${mnt_src} \
+|| error "Failed to umount at line:$LINENO"
+	    einfo "DONE with ${fs[y]} on /dev/md${z}"
+	    ;;
+    esac
+}
+
+exec_exit_chroot() {
+    case ${1} in
+        success)
+	    do_exec umount /mnt/gentoo/{sys,proc,dev}
+	    mv ${mnt_src}${logdir}/.${fs[y]}/* ${log}/
+	    ;;
+	failure)
+	    ewarn "Moving benchmark data to ${log}."
+	    mv ${mnt_src}${logdir}/.${fs[y]}/* ${log}/
+
+	    einfo "umounting /dev/md${z} at ${mnt_src} location."
+	    do_exec umount ${mnt_src}/{sys,proc,dev}
+	    do_exec umount ${mnt_src}
+
+	    einfo "stopping array at /dev/md${z}."
+	    do_exec mdadm -S /dev/md${z}
+
+	    error "CHROOT SCRIPT FAILED. Exiting."
+	    ;;
+    esac
+}
+
+# check if that sys-process/time is available.
+# fix me
+#[[ ! $(./time --help) ]] && ewarn "emerge sys-process/time then try again. exiting $0"; exit 1
+
+# set up the partition schemas
+for ((w=0;w<${#chunk[*]};w++)); do
+    for ((z=1;z<${partitions}+1;z++)); do
+        # skip extended partition.
+        [ $z = 4 ] && ((z++))
+        if [[ $(mdadm -Qq /dev/md${z}) ]]; then
+        einfo "Stopping array /dev/md${z} using ${chunk[w]}k chunk."
+        mdadm -Sq /dev/md${z}
+        fi
+        einfo "Creating /dev/md${z} using raid${raid_level} with a ${chunk[w]}k chunk."
+        do_exec mdadm -C /dev/md${z} -l ${raid_level} -c ${chunk[w]} -qfR -n ${drives} \
+/dev/sd[$(echo $alphabet|cut -c -${drives})]${z}
+
+        # create log directory structure
+        for ((y=0;y<${#fs[*]};y++)); do
+            case ${fs[y]} in
+                ext2|ext3|ext4)
+	            log="${logdir}/.${fs[y]}"
+	            exec_chkdir ${log}
+	            exec_fs
+                    ;;
+                reiserfs|reiser4|xfs|jfs|btrfs)
+	            log="${logdir}/.${fs[y]}"
+	            exec_chkdir ${log}
+	            exec_fs
+	            ;;
+            esac
+        done
+    done
+done
+
+    einfo "Stopping RAID arrays."
+
+    for ((z=1;z<${partitions}+1;z++)); do
+        # skip extended partition.
+	[ $z = 4 ] && ((z++))
+	mdadm -Sq /dev/md${z}
+    done
+
+    einfo "All done. enjoy the data :)"
